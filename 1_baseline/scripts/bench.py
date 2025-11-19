@@ -33,6 +33,7 @@ class RequestResult:
     concurrency: int
     ttft: float
     latency: float
+    benchmark_duration: float = 0.0
 
 
 def build_chat_for_target_tokens(
@@ -178,33 +179,32 @@ async def run_config(
         List[RequestResult]: Collected metrics for each request."""
 
     print(
-        f'[bench] target_prompt_len={prompt_len_target}, '
-        f'actual_prompt_len={prompt_len_actual}, out_len={out_len}, '
-        f'concurrency={concurrency}, num_requests={num_requests}'
+        f'[bench] target={prompt_len_target}, concurrency={concurrency}, '
+        f'num_requests={num_requests}...'
     )
 
-    results: List[RequestResult] = []
+    sem = asyncio.Semaphore(concurrency)
 
-    remaining = num_requests
-    while remaining > 0:
-        batch_size = min(remaining, concurrency)
-        tasks = [
-            asyncio.create_task(
-                run_one_request(
-                    client=client,
-                    model=model,
-                    messages=messages,
-                    prompt_len_actual=prompt_len_actual,
-                    prompt_len_target=prompt_len_target,
-                    out_len=out_len,
-                    concurrency=concurrency,
-                )
+    async def run_throttled():
+        async with sem:
+            return await run_one_request(
+                client=client,
+                model=model,
+                messages=messages,
+                prompt_len_actual=prompt_len_actual,
+                prompt_len_target=prompt_len_target,
+                out_len=out_len,
+                concurrency=concurrency,
             )
-            for _ in range(batch_size)
-        ]
-        batch_results = await asyncio.gather(*tasks)
-        results.extend(batch_results)
-        remaining -= batch_size
+
+    tasks = [asyncio.create_task(run_throttled()) for _ in range(num_requests)]
+    start_time = time.perf_counter()
+    results = await asyncio.gather(*tasks)
+    end_time = time.perf_counter()
+
+    total_wall_time = end_time - start_time
+    for r in results:
+        r.benchmark_duration = total_wall_time
 
     return results
 
@@ -230,24 +230,34 @@ def aggregate(results: List[RequestResult]) -> List[Dict[str, Any]]:
     for (prompt_len_target, concurrency), group in sorted(key_to_results.items()):
         ttfts = np.array([g.ttft for g in group], dtype=float)
         lats = np.array([g.latency for g in group], dtype=float)
+        wall_time = group[0].benchmark_duration
         prompt_len_actual = group[0].prompt_len
         out_len = group[0].out_len
-        total_tokens_per_req = prompt_len_actual + out_len
-        total_tokens = total_tokens_per_req * len(group)
-        total_time = float(lats.sum())
-        toks_per_sec = total_tokens / total_time if total_time > 0 else 0.0
+        num_reqs = len(group)
+
+        total_out_tokens = out_len * num_reqs
+        total_all_tokens = (prompt_len_actual + out_len) * num_reqs
+
+        if wall_time > 0:
+            out_tok_sec = total_out_tokens / wall_time
+            total_tok_sec = total_all_tokens / wall_time
+        else:
+            out_tok_sec = 0.0
+            total_tok_sec = 0.0
 
         row = {
             'prompt_len_target': prompt_len_target,
             'prompt_len_actual': prompt_len_actual,
             'out_len': out_len,
             'concurrency': concurrency,
-            'num_requests': len(group),
+            'num_requests': num_reqs,
+            'benchmark_duration_s': wall_time,
             'ttft_p50_s': float(np.percentile(ttfts, 50)),
             'ttft_p95_s': float(np.percentile(ttfts, 95)),
             'lat_p50_s': float(np.percentile(lats, 50)),
             'lat_p95_s': float(np.percentile(lats, 95)),
-            'tokens_per_second': toks_per_sec,
+            'output_tokens_per_s': out_tok_sec,
+            'total_tokens_per_s': total_tok_sec,
         }
         rows.append(row)
 
@@ -300,11 +310,13 @@ async def main_async(args: argparse.Namespace) -> None:
         'out_len',
         'concurrency',
         'num_requests',
+        'benchmark_duration_s',
         'ttft_p50_s',
         'ttft_p95_s',
         'lat_p50_s',
         'lat_p95_s',
-        'tokens_per_second',
+        'output_tokens_per_s',
+        'total_tokens_per_s',
     ]
 
     df = pd.DataFrame(rows, columns=fieldnames)
